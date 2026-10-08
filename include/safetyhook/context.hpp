@@ -185,25 +185,29 @@ inline FpuF80 Fpu::f80() noexcept {
 }
 #endif
 
-/// @brief 28-byte x87 operating environment saved by FNSAVE (32-bit protected mode).
-/// @details Stored opaquely; FRSTOR replays it verbatim. top() reflects the captured
-///         value and is not re-derived after st_push/st_pop rotate the slot bytes.
+/// @brief 28-byte x87 operating environment saved by FNSAVE (32-bit protected mode, Intel SDM Vol. 1, 8.1.10).
+/// @details FRSTOR replays it on return. st_push_f*() and st_pop*() keep TOP and the tag word in step with the slots
+///          they move, like fld / fstp st(0) would.
 #pragma pack(push, 1)
 struct FpuEnv {
-    uint16_t fcw;          ///< Control word (rounding, precision, exception masks).
-    uint16_t fsw;          ///< Status word (TOP in bits 11..13, condition codes).
-    uint16_t ftw;          ///< Tag word (2 bits per physical register).
-    uint16_t fop;          ///< Last x87 opcode.
-    uint32_t fip;          ///< Instruction pointer offset.
-    uint16_t fip_selector; ///< FIP CS selector.
-    uint16_t fip_reserved; ///< Reserved.
-    uint32_t fdp;          ///< Data pointer offset.
-    uint16_t fdp_selector; ///< FDP CS selector.
-    uint16_t fdp_reserved; ///< Reserved.
-    uint32_t reserved;     ///< Final 4 reserved bytes (env size = 28).
+    uint16_t fcw;       ///< Control word (rounding, precision, exception masks).
+    uint16_t reserved0; ///< Reserved.
+    uint16_t fsw;       ///< Status word (TOP in bits 11..13, condition codes, exception flags).
+    uint16_t reserved1; ///< Reserved.
+    uint16_t ftw;       ///< Tag word: 2 bits per physical register (00 valid, 01 zero, 10 special, 11 empty).
+    uint16_t reserved2; ///< Reserved.
+    uint32_t fip;       ///< Last x87 instruction pointer offset.
+    uint16_t fcs;       ///< Last x87 instruction CS selector.
+    uint16_t fop;       ///< Last x87 opcode (low 11 bits).
+    uint32_t fdp;       ///< Last x87 operand pointer offset.
+    uint16_t fds;       ///< Last x87 operand DS selector.
+    uint16_t reserved3; ///< Reserved.
 
     /// @return Physical register index of ST(0), 0..7.
     [[nodiscard]] uint8_t top() const noexcept { return (fsw >> 11) & 7; }
+
+    /// @return Tag (0 valid, 1 zero, 2 special, 3 empty) of physical register `index` (0..7).
+    [[nodiscard]] uint8_t tag(uint8_t index) const noexcept { return (ftw >> ((index & 7) * 2)) & 3; }
 };
 #pragma pack(pop)
 
@@ -242,22 +246,36 @@ struct Context32 {
     uintptr_t eflags, edi, esi, edx, ecx, ebx, eax, ebp, esp, trampoline_esp, eip;
 
 #if SAFETYHOOK_ARCH_X86_32
-    /// @brief Pop ST(0): shift st1..st7 down into st0..st6 (cf. `fstp st(0)`).
-    /// @note Rotates slot bytes only; fpu_env (TOP, FTW) is NOT re-derived. FRSTOR
-    ///       reinstates the captured env with the rotated slots, so hooked code sees
-    ///       correct values, but fpu_env.fsw/ftw still show the pre-pop state.
-    ///       Prefer f32()/f64()/f80() for env-consistent single-slot writes.
+    /// @brief Pop ST(0), like `fstp st(0)`: st1..st7 move down to st0..st6, ST(0)'s register is tagged empty and
+    /// TOP is incremented.
+    /// @note Popping an empty stack is a stack underflow, as on the FPU: IE and SF are set and C1 cleared; when the
+    /// invalid-operation exception is unmasked, the stack is left unchanged and the exception is raised on the next
+    /// x87 instruction of the hooked code.
     void st_pop() noexcept;
 
-    /// @brief Push `v` as the new ST(0), shifting st0..st6 up to st1..st7 (cf. `fld dword`).
-    /// @note Same env caveat as st_pop: slot bytes are rotated but fpu_env is not updated.
-    /// @param v The value to load as the new ST(0).
+    /// @brief Pop ST(0) and return it as a float, like `fstp dword`.
+    /// @return The popped value, or the x87 indefinite (NaN) when the stack was empty.
+    [[nodiscard]] float st_pop_f32() noexcept;
+
+    /// @brief Pop ST(0) and return it as a double, like `fstp qword`.
+    /// @return The popped value, or the x87 indefinite (NaN) when the stack was empty.
+    [[nodiscard]] double st_pop_f64() noexcept;
+
+    /// @brief Push `value` as the new ST(0), like `fld dword`: st0..st6 move up to st1..st7, TOP is decremented and
+    /// the new register is tagged from its value.
+    /// @note Pushing onto a full stack is a stack overflow, as on the FPU: IE, SF and C1 are set and, when the
+    /// invalid-operation exception is masked, the indefinite (NaN) is pushed instead; when it is unmasked, the stack is
+    /// left unchanged and the exception is raised on the next x87 instruction of the hooked code.
+    /// @param value The value to load as the new ST(0).
     void st_push_f32(float value) noexcept;
 
-    /// @brief Push `v` as the new ST(0), shifting st0..st6 up to st1..st7 (cf. `fld qword`).
-    /// @note Same env caveat as st_pop: slot bytes are rotated but fpu_env is not updated.
-    /// @param v The value to load as the new ST(0).
+    /// @brief Push `value` as the new ST(0), like `fld qword`. See st_push_f32().
+    /// @param value The value to load as the new ST(0).
     void st_push_f64(double value) noexcept;
+
+private:
+    void st_push(const Fpu& value) noexcept;
+    [[nodiscard]] Fpu st_pop_value() noexcept;
 #endif
 };
 
@@ -272,6 +290,10 @@ using Context = Context64;
 using Context = Context32;
 
 static_assert(sizeof(FpuEnv) == 28, "FpuEnv must match the 28-byte FNSAVE environment image");
+static_assert(offsetof(FpuEnv, fsw) == 4, "FNSAVE: FSW at +4");
+static_assert(offsetof(FpuEnv, ftw) == 8, "FNSAVE: FTW at +8");
+static_assert(offsetof(FpuEnv, fip) == 12, "FNSAVE: FIP at +12");
+static_assert(offsetof(FpuEnv, fdp) == 20, "FNSAVE: FDP at +20");
 static_assert(sizeof(Fpu) == 10, "Fpu must match the 10-byte x87 register slot");
 
 // Context32 layout is consumed by the hand-written x87 trampoline in

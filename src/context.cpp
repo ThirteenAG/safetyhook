@@ -146,21 +146,130 @@ void Fpu::set_f64(double value) noexcept {
 
 #endif
 
-void Context32::st_pop() noexcept {
+namespace {
+constexpr uint16_t FCW_IM = 1u << 0; // invalid-operation exception mask
+constexpr uint16_t FSW_IE = 1u << 0; // invalid operation
+constexpr uint16_t FSW_SF = 1u << 6; // stack fault
+constexpr uint16_t FSW_ES = 1u << 7; // exception summary
+constexpr uint16_t FSW_C1 = 1u << 9; // condition code 1 (overflow / underflow on a stack fault)
+constexpr uint16_t FSW_B = 1u << 15; // busy, mirrors ES
+constexpr uint16_t FSW_TOP = 7u << 11;
+
+constexpr uint8_t TAG_VALID = 0;
+constexpr uint8_t TAG_ZERO = 1;
+constexpr uint8_t TAG_SPECIAL = 2;
+constexpr uint8_t TAG_EMPTY = 3;
+
+// QNaN floating-point indefinite, what a masked stack fault loads.
+constexpr Fpu INDEFINITE{{0, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF, 0xFF}};
+
+// The tag the FPU gives a register holding `value`.
+uint8_t tag_of(const Fpu& value) noexcept {
+    const auto exponent = static_cast<uint16_t>(value.raw[8] | ((value.raw[9] & 0x7F) << 8));
+    uint64_t significand{};
+    std::memcpy(&significand, value.raw, sizeof(significand));
+
+    if (exponent == 0x7FFF) {
+        return TAG_SPECIAL; // infinity or NaN
+    }
+
+    if (exponent == 0) {
+        return significand == 0 ? TAG_ZERO : TAG_SPECIAL; // zero, or denormal / pseudo-denormal
+    }
+
+    // Integer bit clear with a non-zero exponent: unnormal.
+    return (significand >> 63) != 0 ? TAG_VALID : TAG_SPECIAL;
+}
+
+void set_tag(FpuEnv& env, uint8_t index, uint8_t tag) noexcept {
+    const auto shift = (index & 7u) * 2u;
+    env.ftw = static_cast<uint16_t>((env.ftw & ~(3u << shift)) | (static_cast<unsigned>(tag) << shift));
+}
+
+void set_top(FpuEnv& env, uint8_t top) noexcept {
+    env.fsw = static_cast<uint16_t>((env.fsw & ~FSW_TOP) | ((top & 7u) << 11));
+}
+
+// Records an x87 stack fault (#IS) like the FPU does. Returns true when the exception is masked, in which case the
+// instruction still completes; an unmasked one leaves the stack alone and is raised by the next x87 instruction.
+bool stack_fault(FpuEnv& env, bool overflow) noexcept {
+    env.fsw =
+        static_cast<uint16_t>(overflow ? env.fsw | FSW_IE | FSW_SF | FSW_C1 : (env.fsw | FSW_IE | FSW_SF) & ~FSW_C1);
+
+    if ((env.fcw & FCW_IM) != 0) {
+        return true;
+    }
+
+    env.fsw |= FSW_ES | FSW_B;
+
+    return false;
+}
+} // namespace
+
+void Context32::st_push(const Fpu& value) noexcept {
+    const auto top = static_cast<uint8_t>((fpu_env.top() - 1) & 7);
+    auto loaded = value;
+
+    if (fpu_env.tag(top) != TAG_EMPTY) {
+        if (!stack_fault(fpu_env, true)) {
+            return;
+        }
+
+        loaded = INDEFINITE;
+    } else {
+        fpu_env.fsw &= static_cast<uint16_t>(~FSW_C1);
+    }
+
+    std::memmove(&st1, &st0, sizeof(Fpu) * 7);
+    st0 = loaded;
+    set_top(fpu_env, top);
+    set_tag(fpu_env, top, tag_of(loaded));
+}
+
+Fpu Context32::st_pop_value() noexcept {
+    const auto top = fpu_env.top();
+    auto value = st0;
+
+    if (fpu_env.tag(top) == TAG_EMPTY) {
+        if (!stack_fault(fpu_env, false)) {
+            return INDEFINITE;
+        }
+
+        value = INDEFINITE;
+    } else {
+        fpu_env.fsw &= static_cast<uint16_t>(~FSW_C1);
+    }
+
     std::memmove(&st0, &st1, sizeof(Fpu) * 7);
     st7 = Fpu{};
+    set_tag(fpu_env, top, TAG_EMPTY);
+    set_top(fpu_env, static_cast<uint8_t>(top + 1));
+
+    return value;
+}
+
+void Context32::st_pop() noexcept {
+    (void)st_pop_value();
+}
+
+float Context32::st_pop_f32() noexcept {
+    return st_pop_value().as_f32();
+}
+
+double Context32::st_pop_f64() noexcept {
+    return st_pop_value().as_f64();
 }
 
 void Context32::st_push_f32(float value) noexcept {
-    std::memmove(&st1, &st0, sizeof(Fpu) * 7);
-
-    st0.set_f32(value);
+    Fpu slot{};
+    slot.set_f32(value);
+    st_push(slot);
 }
 
 void Context32::st_push_f64(double value) noexcept {
-    std::memmove(&st1, &st0, sizeof(Fpu) * 7);
-
-    st0.set_f64(value);
+    Fpu slot{};
+    slot.set_f64(value);
+    st_push(slot);
 }
 
 #endif // SAFETYHOOK_ARCH_X86_32

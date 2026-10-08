@@ -1,4 +1,6 @@
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 
 #include <gtest/gtest.h>
 #include <safetyhook.hpp>
@@ -400,6 +402,191 @@ TEST(MidHookX87, StProxyArithmeticOps) {
     target(&out);
 
     EXPECT_FLOAT_EQ(out, 1.0f);
+}
+
+// The callback's view of the FNSAVE environment matches what the FPU saved: fninit control word, TOP after two pushes
+// and the tag of every physical register.
+TEST(MidHookX87, FpuEnvMatchesFnsaveLayout) {
+    Xbyak::CodeGenerator cg{};
+
+    cg.fninit();
+    cg.fld1();
+    cg.fldz();
+
+    auto nop_offset = cg.getSize();
+
+    cg.nop(5);
+    cg.fninit();
+    cg.ret();
+
+    auto volatile target = cg.getCode<void(SAFETYHOOK_CCALL*)()>();
+
+    SafetyHookMid hook{};
+
+    struct Hook {
+        static void cb(SafetyHookContext& ctx) {
+            EXPECT_EQ(ctx.fpu_env.fcw, 0x037F);
+            EXPECT_EQ(ctx.fpu_env.top(), 6);
+            EXPECT_EQ(ctx.fpu_env.tag(6), 1); // ST(0) = 0.0: zero
+            EXPECT_EQ(ctx.fpu_env.tag(7), 0); // ST(1) = 1.0: valid
+
+            for (uint8_t i = 0; i < 6; ++i) {
+                EXPECT_EQ(ctx.fpu_env.tag(i), 3); // empty
+            }
+        }
+    };
+
+    auto hr = SafetyHookMid::create(reinterpret_cast<void*>(const_cast<uint8_t*>(cg.getCode() + nop_offset)), Hook::cb);
+
+    ASSERT_TRUE(hr.has_value());
+
+    hook = std::move(*hr);
+
+    target();
+}
+
+namespace x87_diff {
+constexpr float ONE = 1.0f;
+constexpr float TWO = 2.0f;
+constexpr float FOUR = 4.0f;
+
+// TOP, C1, IE, SF, ES and B: what fld / fstp define. C0, C2, C3 are undefined after them.
+constexpr uint16_t FSW_MASK = 0x3800 | 0x0200 | 0x0001 | 0x0040 | 0x0080 | 0x8000;
+
+struct Result {
+    float out;
+    safetyhook::FpuEnv env;
+};
+
+using Emit = void (*)(Xbyak::CodeGenerator&);
+using Callback = void (*)(SafetyHookContext&);
+
+// Runs `prologue; site; epilogue` and returns the stored float and the environment the FPU reports after it. With a
+// callback, the site is a mid hook on a nop instead of the real instruction(s).
+Result run(Emit prologue, Emit site, Emit epilogue, Callback callback) {
+    Xbyak::CodeGenerator cg{};
+
+    cg.mov(eax, dword[esp + 4]);
+    cg.fninit();
+    prologue(cg);
+
+    auto site_offset = cg.getSize();
+
+    if (callback != nullptr) {
+        cg.nop(5);
+    } else {
+        site(cg);
+    }
+
+    epilogue(cg);
+    cg.mov(ecx, dword[esp + 8]);
+    cg.fnstenv(ptr[ecx]);
+    cg.fninit();
+    cg.ret();
+
+    SafetyHookMid hook{};
+
+    if (callback != nullptr) {
+        auto hr =
+            SafetyHookMid::create(reinterpret_cast<void*>(const_cast<uint8_t*>(cg.getCode() + site_offset)), callback);
+
+        EXPECT_TRUE(hr.has_value());
+
+        if (hr) {
+            hook = std::move(*hr);
+        }
+    }
+
+    auto volatile target = cg.getCode<void(SAFETYHOOK_CCALL*)(float*, safetyhook::FpuEnv*)>();
+
+    Result result{};
+    target(&result.out, &result.env);
+
+    return result;
+}
+
+void expect_same(const Result& fpu, const Result& hooked) {
+    EXPECT_EQ(fpu.env.fsw & FSW_MASK, hooked.env.fsw & FSW_MASK);
+    EXPECT_EQ(fpu.env.ftw, hooked.env.ftw);
+    EXPECT_EQ(std::memcmp(&fpu.out, &hooked.out, sizeof(float)), 0) << fpu.out << " vs " << hooked.out;
+}
+
+void none(Xbyak::CodeGenerator&) {
+}
+} // namespace x87_diff
+
+// A mid hook replacing `fld` on an empty stack (cursey/safetyhook#130, Deer Avenger 4): the following fdiv must see
+// the pushed value, not an empty register.
+TEST(MidHookX87, StPushOntoEmptyStackActsLikeFld) {
+    using namespace x87_diff;
+
+    auto site = [](Xbyak::CodeGenerator& cg) { cg.fld(dword[reinterpret_cast<uintptr_t>(&ONE)]); };
+    auto epilogue = [](Xbyak::CodeGenerator& cg) {
+        cg.fdiv(dword[reinterpret_cast<uintptr_t>(&FOUR)]);
+        cg.fstp(dword[eax]);
+    };
+
+    auto fpu = run(none, site, epilogue, nullptr);
+    auto hooked = run(none, site, epilogue, [](SafetyHookContext& ctx) { ctx.st_push_f32(1.0f); });
+
+    EXPECT_FLOAT_EQ(fpu.out, 0.25f);
+    expect_same(fpu, hooked);
+}
+
+namespace x87_diff {
+float popped{};
+} // namespace x87_diff
+
+TEST(MidHookX87, StPopF32ActsLikeFstp) {
+    using namespace x87_diff;
+
+    auto prologue = [](Xbyak::CodeGenerator& cg) {
+        cg.fld1();
+        cg.fld(dword[reinterpret_cast<uintptr_t>(&TWO)]);
+    };
+    auto site = [](Xbyak::CodeGenerator& cg) { cg.fstp(dword[reinterpret_cast<uintptr_t>(&popped)]); };
+    auto epilogue = [](Xbyak::CodeGenerator& cg) { cg.fstp(dword[eax]); };
+
+    popped = 0.0f;
+    auto fpu = run(prologue, site, epilogue, nullptr);
+    EXPECT_FLOAT_EQ(popped, 2.0f);
+
+    popped = 0.0f;
+    auto hooked = run(prologue, site, epilogue, [](SafetyHookContext& ctx) { popped = ctx.st_pop_f32(); });
+    EXPECT_FLOAT_EQ(popped, 2.0f);
+
+    EXPECT_FLOAT_EQ(fpu.out, 1.0f);
+    expect_same(fpu, hooked);
+}
+
+TEST(MidHookX87, StPopOnEmptyStackUnderflowsLikeFstp) {
+    using namespace x87_diff;
+
+    auto site = [](Xbyak::CodeGenerator& cg) { cg.fstp(st0); };
+
+    auto fpu = run(none, site, none, nullptr);
+    auto hooked = run(none, site, none, [](SafetyHookContext& ctx) { ctx.st_pop(); });
+
+    EXPECT_NE(fpu.env.fsw & 0x0041, 0); // IE and SF
+    expect_same(fpu, hooked);
+}
+
+TEST(MidHookX87, StPushOntoFullStackOverflowsLikeFld) {
+    using namespace x87_diff;
+
+    auto prologue = [](Xbyak::CodeGenerator& cg) {
+        for (int i = 0; i < 8; ++i) {
+            cg.fld1();
+        }
+    };
+    auto site = [](Xbyak::CodeGenerator& cg) { cg.fld(dword[reinterpret_cast<uintptr_t>(&TWO)]); };
+    auto epilogue = [](Xbyak::CodeGenerator& cg) { cg.fst(dword[eax]); };
+
+    auto fpu = run(prologue, site, epilogue, nullptr);
+    auto hooked = run(prologue, site, epilogue, [](SafetyHookContext& ctx) { ctx.st_push_f32(2.0f); });
+
+    EXPECT_TRUE(std::isnan(fpu.out)); // masked stack overflow loads the indefinite
+    expect_same(fpu, hooked);
 }
 
 #if defined(__LDBL_MANT_DIG__) && __LDBL_MANT_DIG__ == 64
